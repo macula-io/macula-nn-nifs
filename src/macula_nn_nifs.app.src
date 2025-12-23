@@ -1,0 +1,10 @@
+{application, macula_nn_nifs, [
+    {description, "High-performance Rust NIFs for Macula Neuroevolution (Enterprise)"},
+    {vsn, "0.1.0"},
+    {registered, []},
+    {applications, [kernel, stdlib]},
+    {env, []},
+    {modules, []},
+    {licenses, ["Apache-2.0"]},
+    {links, []}
+]}.
