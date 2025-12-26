@@ -1,6 +1,6 @@
 [package]
 name = "macula_nn_nifs"
-version = "0.1.0"
+version = "0.2.0"
 authors = ["Macula.io"]
 edition = "2021"
 description = "High-performance Rust NIFs for Macula Neuroevolution (Enterprise)"
