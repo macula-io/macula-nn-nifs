@@ -38,6 +38,9 @@ mod atoms {
         hidden,
         output,
         bias,
+        // Distance types
+        l1,
+        l2,
         // Aggregation functions
         dot_product,
         mult_product,
@@ -1293,61 +1296,718 @@ fn dot_product_preflattened(
         + bias
 }
 
-#[allow(deprecated)]
-rustler::init!(
-    "macula_nn_nifs",
-    [
-        // Network compilation and evaluation
-        compile_network,
-        evaluate,
-        evaluate_batch,
-        compatibility_distance,
-        benchmark_evaluate,
-        // Signal aggregation NIFs
-        dot_product_flat,
-        dot_product_batch,
-        dot_product_preflattened,
-        flatten_weights,
-        // LTC/CfC functions
-        evaluate_cfc,
-        evaluate_cfc_with_weights,
-        evaluate_ode,
-        evaluate_ode_with_weights,
-        evaluate_cfc_batch,
-        // Distance and KNN (Novelty Search)
-        euclidean_distance,
-        euclidean_distance_batch,
-        knn_novelty,
-        knn_novelty_batch,
-        // Statistics
-        fitness_stats,
-        weighted_moving_average,
-        shannon_entropy,
-        histogram,
-        // Selection
-        build_cumulative_fitness,
-        roulette_select,
-        roulette_select_batch,
-        tournament_select,
-        // Reward and Meta-Controller
-        z_score,
-        compute_reward_component,
-        compute_weighted_reward,
-        // Batch Mutation (Evolutionary Genetics)
-        mutate_weights,
-        mutate_weights_seeded,
-        mutate_weights_batch,
-        mutate_weights_batch_uniform,
-        random_weights,
-        random_weights_seeded,
-        random_weights_gaussian,
-        random_weights_batch,
-        weight_distance_l1,
-        weight_distance_l2,
-        weight_distance_batch
-    ],
-    load = load
-);
+// ============================================================================
+// P0: Layer-specific Mutation
+// ============================================================================
+
+/// Mutate weights with different rates for reservoir vs readout layers.
+///
+/// Applies different mutation parameters to reservoir (hidden) layers and
+/// readout (output) layer, supporting the reservoir computing paradigm.
+#[rustler::nif(schedule = "DirtyCpu")]
+fn mutate_weights_layered(
+    weights: Vec<f64>,
+    reservoir_weight_count: usize,
+    reservoir_mut_rate: f64,
+    reservoir_strength: f64,
+    readout_mut_rate: f64,
+    readout_strength: f64,
+) -> Vec<f64> {
+    let mut rng = thread_rng();
+    let perturb_rate = 0.9; // High probability of perturbation vs replacement
+
+    weights
+        .into_iter()
+        .enumerate()
+        .map(|(i, w)| {
+            if i < reservoir_weight_count {
+                // Reservoir layer
+                mutate_single_weight(w, reservoir_mut_rate, perturb_rate, reservoir_strength, &mut rng)
+            } else {
+                // Readout layer
+                mutate_single_weight(w, readout_mut_rate, perturb_rate, readout_strength, &mut rng)
+            }
+        })
+        .collect()
+}
+
+/// Compute weight counts per layer from topology.
+///
+/// Topology format: [InputSize, Hidden1Size, ..., OutputSize]
+/// Returns weight count for each layer (layer i weights = size[i] * size[i-1])
+#[rustler::nif]
+fn compute_layer_weight_counts(topology: Vec<usize>) -> Vec<usize> {
+    if topology.len() < 2 {
+        return vec![];
+    }
+
+    topology
+        .windows(2)
+        .map(|pair| pair[0] * pair[1])
+        .collect()
+}
+
+// ============================================================================
+// P0: SIMD Batch Activations
+// ============================================================================
+
+/// Apply tanh activation to a batch of values.
+#[rustler::nif(schedule = "DirtyCpu")]
+fn tanh_batch(values: Vec<f64>) -> Vec<f64> {
+    values.into_iter().map(|x| x.tanh()).collect()
+}
+
+/// Apply sigmoid activation to a batch of values.
+#[rustler::nif(schedule = "DirtyCpu")]
+fn sigmoid_batch(values: Vec<f64>) -> Vec<f64> {
+    values.into_iter().map(|x| {
+        let v = x.clamp(-10.0, 10.0);
+        1.0 / (1.0 + (-v).exp())
+    }).collect()
+}
+
+/// Apply ReLU activation to a batch of values.
+#[rustler::nif(schedule = "DirtyCpu")]
+fn relu_batch(values: Vec<f64>) -> Vec<f64> {
+    values.into_iter().map(|x| x.max(0.0)).collect()
+}
+
+/// Apply softmax to a batch of values (normalized exponential).
+#[rustler::nif]
+fn softmax_batch(values: Vec<f64>) -> Vec<f64> {
+    if values.is_empty() {
+        return vec![];
+    }
+
+    // Numerical stability: subtract max before exp
+    let max_val = values.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+    let exp_values: Vec<f64> = values.iter().map(|&x| (x - max_val).exp()).collect();
+    let sum: f64 = exp_values.iter().sum();
+
+    if sum == 0.0 {
+        return vec![1.0 / values.len() as f64; values.len()];
+    }
+
+    exp_values.into_iter().map(|e| e / sum).collect()
+}
+
+/// Apply specified activation function to batch of values.
+#[rustler::nif(schedule = "DirtyCpu")]
+fn activation_batch(values: Vec<f64>, activation: Atom) -> Vec<f64> {
+    let act = Activation::from_atom(activation);
+    values.into_iter().map(|x| act.apply(x)).collect()
+}
+
+// ============================================================================
+// P1: Plasticity Computation
+// ============================================================================
+
+/// Batch Hebbian weight update.
+/// dW = eta * pre * post - decay * W, clamped to max_weight
+#[rustler::nif(schedule = "DirtyCpu")]
+fn hebbian_update_batch(
+    weight_activities: Vec<(f64, f64, f64)>,  // [(weight, pre, post), ...]
+    learning_rate: f64,
+    decay_rate: f64,
+    max_weight: f64,
+) -> Vec<f64> {
+    weight_activities
+        .into_iter()
+        .map(|(w, pre, post)| {
+            let dw = learning_rate * pre * post - decay_rate * w;
+            (w + dw).clamp(-max_weight, max_weight)
+        })
+        .collect()
+}
+
+/// Batch modulated Hebbian update with reward signal.
+/// dW = eta * reward * pre * post - decay * W
+#[rustler::nif(schedule = "DirtyCpu")]
+fn modulated_hebbian_batch(
+    weight_activities: Vec<(f64, f64, f64)>,  // [(weight, pre, post), ...]
+    learning_rate: f64,
+    reward: f64,
+    decay_rate: f64,
+    max_weight: f64,
+) -> Vec<f64> {
+    weight_activities
+        .into_iter()
+        .map(|(w, pre, post)| {
+            let dw = learning_rate * reward * pre * post - decay_rate * w;
+            (w + dw).clamp(-max_weight, max_weight)
+        })
+        .collect()
+}
+
+/// STDP update for a single weight.
+/// Potentiation if pre fires before post, depression otherwise.
+#[rustler::nif]
+fn stdp_update(
+    weight: f64,
+    delta_t: f64,      // t_post - t_pre
+    a_plus: f64,       // Amplitude of potentiation
+    a_minus: f64,      // Amplitude of depression
+    tau: f64,          // Time constant (used for both)
+) -> f64 {
+    let dw = if delta_t > 0.0 {
+        // Pre before post -> potentiation
+        a_plus * (-delta_t / tau).exp()
+    } else {
+        // Post before pre -> depression
+        -a_minus * (delta_t / tau).exp()
+    };
+    weight + dw
+}
+
+/// Batch Oja's rule update (normalized Hebbian).
+/// dW = eta * (post * pre - post^2 * W)
+#[rustler::nif(schedule = "DirtyCpu")]
+fn oja_update_batch(
+    weight_activities: Vec<(f64, f64, f64)>,  // [(weight, pre, post), ...]
+    learning_rate: f64,
+    decay_rate: f64,
+    max_weight: f64,
+) -> Vec<f64> {
+    weight_activities
+        .into_iter()
+        .map(|(w, pre, post)| {
+            let dw = learning_rate * (post * pre - post * post * w) - decay_rate * w;
+            (w + dw).clamp(-max_weight, max_weight)
+        })
+        .collect()
+}
+
+// ============================================================================
+// P1: Time Series LTC/CfC
+// ============================================================================
+
+/// Evaluate CfC over a sequence of inputs with state persistence.
+#[rustler::nif(schedule = "DirtyCpu")]
+fn evaluate_cfc_sequence(
+    inputs: Vec<f64>,
+    initial_state: f64,
+    tau: f64,
+    bound: f64,
+    backbone_weights: Vec<f64>,
+) -> Vec<(f64, f64)> {
+    let mut state = initial_state;
+    inputs
+        .into_iter()
+        .map(|input| {
+            let (new_state, output) = evaluate_cfc_impl(input, state, tau, bound, &backbone_weights, &[]);
+            state = new_state;
+            (new_state, output)
+        })
+        .collect()
+}
+
+/// Evaluate multiple CfC neurons in parallel.
+#[rustler::nif(schedule = "DirtyCpu")]
+fn evaluate_cfc_parallel(
+    input: f64,
+    neuron_params: Vec<(f64, f64, f64)>,  // [(state, tau, bound), ...]
+    backbone_weights: Vec<f64>,
+    head_weights: Vec<f64>,
+) -> Vec<(f64, f64)> {
+    neuron_params
+        .into_iter()
+        .map(|(state, tau, bound)| {
+            evaluate_cfc_impl(input, state, tau, bound, &backbone_weights, &head_weights)
+        })
+        .collect()
+}
+
+/// Batch LTC state update for multiple neurons.
+#[rustler::nif(schedule = "DirtyCpu")]
+fn ltc_state_batch(
+    inputs: Vec<f64>,
+    states: Vec<f64>,
+    taus: Vec<f64>,
+    dt: f64,
+) -> Vec<f64> {
+    inputs
+        .into_iter()
+        .zip(states)
+        .zip(taus)
+        .map(|((input, state), tau)| {
+            let (new_state, _) = evaluate_ode_impl(input, state, tau, 1.0, dt, &[], &[]);
+            new_state
+        })
+        .collect()
+}
+
+// ============================================================================
+// P1: Population Diversity
+// ============================================================================
+
+/// Compute population diversity metrics.
+/// Returns (mean_dist, std_dist, min_dist, max_dist)
+#[rustler::nif(schedule = "DirtyCpu")]
+fn population_diversity(population: Vec<Vec<f64>>) -> (f64, f64, f64, f64) {
+    let n = population.len();
+    if n < 2 {
+        return (0.0, 0.0, 0.0, 0.0);
+    }
+
+    let mut distances: Vec<f64> = Vec::with_capacity(n * (n - 1) / 2);
+
+    for i in 0..n {
+        for j in (i + 1)..n {
+            let dist: f64 = population[i]
+                .iter()
+                .zip(population[j].iter())
+                .map(|(a, b)| (a - b) * (a - b))
+                .sum::<f64>()
+                .sqrt();
+            distances.push(dist);
+        }
+    }
+
+    if distances.is_empty() {
+        return (0.0, 0.0, 0.0, 0.0);
+    }
+
+    let min_dist = distances.iter().cloned().fold(f64::INFINITY, f64::min);
+    let max_dist = distances.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+    let mean_dist = distances.iter().sum::<f64>() / distances.len() as f64;
+    let variance = distances.iter().map(|d| (d - mean_dist) * (d - mean_dist)).sum::<f64>() / distances.len() as f64;
+    let std_dist = variance.sqrt();
+
+    (mean_dist, std_dist, min_dist, max_dist)
+}
+
+/// Compute weight covariance matrix.
+/// Returns flattened covariance matrix (row-major order).
+#[rustler::nif(schedule = "DirtyCpu")]
+fn weight_covariance_matrix(population: Vec<Vec<f64>>) -> Vec<f64> {
+    if population.is_empty() || population[0].is_empty() {
+        return vec![];
+    }
+
+    let n = population.len() as f64;
+    let dim = population[0].len();
+
+    // Compute means
+    let mut means = vec![0.0; dim];
+    for genome in &population {
+        for (i, &w) in genome.iter().enumerate() {
+            means[i] += w / n;
+        }
+    }
+
+    // Compute covariance matrix
+    let mut cov = vec![0.0; dim * dim];
+    for genome in &population {
+        for i in 0..dim {
+            for j in 0..dim {
+                cov[i * dim + j] += (genome[i] - means[i]) * (genome[j] - means[j]) / n;
+            }
+        }
+    }
+
+    cov
+}
+
+/// Compute all pairwise distances in batch.
+/// Returns flattened upper triangular distance matrix.
+/// dist_type: l1 or l2 (atom)
+#[rustler::nif(schedule = "DirtyCpu")]
+fn pairwise_distances_batch(env: Env<'_>, population: Vec<Vec<f64>>, dist_type: Atom) -> Vec<f64> {
+    let n = population.len();
+    let mut distances: Vec<f64> = Vec::with_capacity(n * (n - 1) / 2);
+
+    // Check if using L1 distance (anything else defaults to L2)
+    let l1_atom = atoms::l1();
+    let use_l1 = dist_type.to_term(env) == l1_atom.to_term(env);
+
+    for i in 0..n {
+        for j in (i + 1)..n {
+            let dist = if use_l1 {
+                // L1 (Manhattan) distance
+                population[i]
+                    .iter()
+                    .zip(population[j].iter())
+                    .map(|(a, b)| (a - b).abs())
+                    .sum()
+            } else {
+                // L2 (Euclidean) distance
+                population[i]
+                    .iter()
+                    .zip(population[j].iter())
+                    .map(|(a, b)| (a - b) * (a - b))
+                    .sum::<f64>()
+                    .sqrt()
+            };
+            distances.push(dist);
+        }
+    }
+
+    distances
+}
+
+// ============================================================================
+// P2: NEAT Crossover
+// ============================================================================
+
+/// NEAT-style crossover between two genomes.
+/// Genes are aligned by innovation number; matching genes randomly selected,
+/// disjoint/excess taken from fitter parent.
+#[rustler::nif]
+fn neat_crossover(
+    genome_a: Vec<(i64, f64, bool)>,  // [(innovation, weight, enabled), ...]
+    genome_b: Vec<(i64, f64, bool)>,
+    fitness_a: f64,
+    fitness_b: f64,
+) -> Vec<(i64, f64, bool)> {
+    let mut rng = thread_rng();
+
+    // Build innovation -> gene maps
+    let map_a: HashMap<i64, (f64, bool)> = genome_a.iter().map(|&(i, w, e)| (i, (w, e))).collect();
+    let map_b: HashMap<i64, (f64, bool)> = genome_b.iter().map(|&(i, w, e)| (i, (w, e))).collect();
+
+    // Get all innovation numbers
+    let mut all_innovations: Vec<i64> = map_a.keys().chain(map_b.keys()).cloned().collect();
+    all_innovations.sort();
+    all_innovations.dedup();
+
+    let (fitter_map, _less_fit_map) = if fitness_a >= fitness_b {
+        (&map_a, &map_b)
+    } else {
+        (&map_b, &map_a)
+    };
+
+    let mut offspring = Vec::with_capacity(all_innovations.len());
+
+    for innov in all_innovations {
+        let gene_a = map_a.get(&innov);
+        let gene_b = map_b.get(&innov);
+
+        match (gene_a, gene_b) {
+            (Some(&(w_a, e_a)), Some(&(w_b, e_b))) => {
+                // Matching gene: randomly select
+                if rng.gen::<bool>() {
+                    offspring.push((innov, w_a, e_a));
+                } else {
+                    offspring.push((innov, w_b, e_b));
+                }
+            }
+            (Some(&(w, e)), None) | (None, Some(&(w, e))) => {
+                // Disjoint or excess: take from fitter parent
+                if fitter_map.contains_key(&innov) {
+                    offspring.push((innov, w, e));
+                }
+                // If from less fit parent, skip
+            }
+            (None, None) => unreachable!(),
+        }
+    }
+
+    offspring
+}
+
+/// Align genes by innovation number.
+/// Returns list of (GeneA_or_None, GeneB_or_None) pairs.
+#[rustler::nif]
+fn align_genes_by_innovation(
+    genome_a: Vec<(i64, f64, bool)>,
+    genome_b: Vec<(i64, f64, bool)>,
+) -> Vec<(Option<(i64, f64, bool)>, Option<(i64, f64, bool)>)> {
+    let map_a: HashMap<i64, (f64, bool)> = genome_a.iter().map(|&(i, w, e)| (i, (w, e))).collect();
+    let map_b: HashMap<i64, (f64, bool)> = genome_b.iter().map(|&(i, w, e)| (i, (w, e))).collect();
+
+    let mut all_innovations: Vec<i64> = map_a.keys().chain(map_b.keys()).cloned().collect();
+    all_innovations.sort();
+    all_innovations.dedup();
+
+    all_innovations
+        .into_iter()
+        .map(|innov| {
+            let a = map_a.get(&innov).map(|&(w, e)| (innov, w, e));
+            let b = map_b.get(&innov).map(|&(w, e)| (innov, w, e));
+            (a, b)
+        })
+        .collect()
+}
+
+/// Count excess and disjoint genes between two genomes.
+/// Returns (excess_count, disjoint_count, matching_count)
+#[rustler::nif]
+fn count_excess_disjoint(
+    genome_a: Vec<(i64, f64, bool)>,
+    genome_b: Vec<(i64, f64, bool)>,
+) -> (usize, usize, usize) {
+    let innovations_a: std::collections::HashSet<i64> = genome_a.iter().map(|&(i, _, _)| i).collect();
+    let innovations_b: std::collections::HashSet<i64> = genome_b.iter().map(|&(i, _, _)| i).collect();
+
+    let max_a = innovations_a.iter().max().copied().unwrap_or(0);
+    let max_b = innovations_b.iter().max().copied().unwrap_or(0);
+    let threshold = max_a.min(max_b);
+
+    let mut excess = 0;
+    let mut disjoint = 0;
+    let mut matching = 0;
+
+    for &innov in &innovations_a {
+        if innovations_b.contains(&innov) {
+            matching += 1;
+        } else if innov > threshold {
+            excess += 1;
+        } else {
+            disjoint += 1;
+        }
+    }
+
+    for &innov in &innovations_b {
+        if !innovations_a.contains(&innov) {
+            if innov > threshold {
+                excess += 1;
+            } else {
+                disjoint += 1;
+            }
+        }
+    }
+
+    (excess, disjoint, matching)
+}
+
+// ============================================================================
+// P2: Speciation Clustering
+// ============================================================================
+
+/// Assign genomes to species in batch.
+/// Returns species indices for each genome.
+#[rustler::nif(schedule = "DirtyCpu")]
+fn assign_species_batch(
+    genomes: Vec<Vec<f64>>,
+    representatives: Vec<Vec<f64>>,
+    threshold: f64,
+) -> Vec<usize> {
+    genomes
+        .iter()
+        .map(|genome| {
+            // Find closest representative
+            let mut best_species = representatives.len(); // New species index
+            let mut best_dist = threshold;
+
+            for (species_idx, rep) in representatives.iter().enumerate() {
+                let dist: f64 = genome
+                    .iter()
+                    .zip(rep.iter())
+                    .map(|(a, b)| (a - b) * (a - b))
+                    .sum::<f64>()
+                    .sqrt();
+
+                if dist < best_dist {
+                    best_dist = dist;
+                    best_species = species_idx;
+                }
+            }
+
+            best_species
+        })
+        .collect()
+}
+
+/// Find representative for a species (closest to centroid).
+#[rustler::nif(schedule = "DirtyCpu")]
+fn find_representative(members: Vec<Vec<f64>>, _method: Atom) -> usize {
+    if members.is_empty() {
+        return 0;
+    }
+
+    if members.len() == 1 {
+        return 0;
+    }
+
+    // Calculate centroid
+    let dim = members[0].len();
+    let n = members.len() as f64;
+    let mut centroid = vec![0.0; dim];
+
+    for member in &members {
+        for (i, &w) in member.iter().enumerate() {
+            centroid[i] += w / n;
+        }
+    }
+
+    // Find member closest to centroid
+    members
+        .iter()
+        .enumerate()
+        .map(|(idx, member)| {
+            let dist: f64 = member
+                .iter()
+                .zip(centroid.iter())
+                .map(|(a, b)| (a - b) * (a - b))
+                .sum::<f64>()
+                .sqrt();
+            (idx, dist)
+        })
+        .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
+        .map(|(idx, _)| idx)
+        .unwrap_or(0)
+}
+
+/// K-means clustering for genomes.
+#[rustler::nif(schedule = "DirtyCpu")]
+fn kmeans_cluster(
+    genomes: Vec<Vec<f64>>,
+    k: usize,
+    max_iterations: usize,
+) -> Vec<usize> {
+    if genomes.is_empty() || k == 0 {
+        return vec![];
+    }
+
+    let n = genomes.len();
+    let dim = genomes[0].len();
+    let k = k.min(n);
+
+    let mut rng = thread_rng();
+
+    // Initialize centroids randomly from genomes
+    let mut centroid_indices: Vec<usize> = (0..n).collect();
+    centroid_indices.shuffle(&mut rng);
+    let mut centroids: Vec<Vec<f64>> = centroid_indices[..k]
+        .iter()
+        .map(|&i| genomes[i].clone())
+        .collect();
+
+    let mut assignments = vec![0usize; n];
+
+    for _ in 0..max_iterations {
+        let mut changed = false;
+
+        // Assignment step
+        for (i, genome) in genomes.iter().enumerate() {
+            let best_cluster = centroids
+                .iter()
+                .enumerate()
+                .map(|(c_idx, centroid)| {
+                    let dist: f64 = genome
+                        .iter()
+                        .zip(centroid.iter())
+                        .map(|(a, b)| (a - b) * (a - b))
+                        .sum();
+                    (c_idx, dist)
+                })
+                .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
+                .map(|(idx, _)| idx)
+                .unwrap_or(0);
+
+            if assignments[i] != best_cluster {
+                assignments[i] = best_cluster;
+                changed = true;
+            }
+        }
+
+        if !changed {
+            break;
+        }
+
+        // Update step
+        for c_idx in 0..k {
+            let members: Vec<&Vec<f64>> = genomes
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| assignments[*i] == c_idx)
+                .map(|(_, g)| g)
+                .collect();
+
+            if !members.is_empty() {
+                let count = members.len() as f64;
+                for d in 0..dim {
+                    centroids[c_idx][d] = members.iter().map(|g| g[d]).sum::<f64>() / count;
+                }
+            }
+        }
+    }
+
+    assignments
+}
+
+// ============================================================================
+// P3: Matrix Operations
+// ============================================================================
+
+/// Matrix multiply with bias addition: Y = X * W + B
+/// X: input vector (1 x input_dim)
+/// W: weight matrix (input_dim x output_dim, flattened row-major)
+/// B: bias vector (output_dim)
+#[rustler::nif(schedule = "DirtyCpu")]
+fn matmul_add_bias(x: Vec<f64>, w: Vec<f64>, b: Vec<f64>) -> Vec<f64> {
+    if b.is_empty() {
+        return vec![];
+    }
+
+    let output_dim = b.len();
+    let input_dim = w.len() / output_dim;
+
+    if x.len() != input_dim {
+        return vec![0.0; output_dim];
+    }
+
+    (0..output_dim)
+        .map(|j| {
+            let sum: f64 = (0..input_dim)
+                .map(|i| x[i] * w[i * output_dim + j])
+                .sum();
+            sum + b[j]
+        })
+        .collect()
+}
+
+/// Single layer forward pass with activation.
+/// Y = activation(X * W + B)
+#[rustler::nif(schedule = "DirtyCpu")]
+fn layer_forward(x: Vec<f64>, w: Vec<f64>, b: Vec<f64>, activation: Atom) -> Vec<f64> {
+    let act = Activation::from_atom(activation);
+    let linear = matmul_add_bias_impl(&x, &w, &b);
+    linear.into_iter().map(|v| act.apply(v)).collect()
+}
+
+fn matmul_add_bias_impl(x: &[f64], w: &[f64], b: &[f64]) -> Vec<f64> {
+    if b.is_empty() {
+        return vec![];
+    }
+
+    let output_dim = b.len();
+    let input_dim = w.len() / output_dim;
+
+    if x.len() != input_dim {
+        return vec![0.0; output_dim];
+    }
+
+    (0..output_dim)
+        .map(|j| {
+            let sum: f64 = (0..input_dim)
+                .map(|i| x[i] * w[i * output_dim + j])
+                .sum();
+            sum + b[j]
+        })
+        .collect()
+}
+
+/// Multi-layer forward pass through network.
+/// Processes input through all layers efficiently.
+#[rustler::nif(schedule = "DirtyCpu")]
+fn multi_layer_forward(
+    input: Vec<f64>,
+    layers: Vec<(Vec<f64>, Vec<f64>, Atom)>,  // [(weights, biases, activation), ...]
+    _layer_sizes: Vec<usize>,
+) -> Vec<f64> {
+    let mut current = input;
+
+    for (weights, biases, activation) in layers {
+        let act = Activation::from_atom(activation);
+        let linear = matmul_add_bias_impl(&current, &weights, &biases);
+        current = linear.into_iter().map(|v| act.apply(v)).collect();
+    }
+
+    current
+}
+
+rustler::init!("macula_nn_nifs", load = load);
 
 #[cfg(test)]
 mod tests {
@@ -1714,5 +2374,623 @@ mod tests {
                 assert!(*w >= -1.0 && *w <= 1.0);
             }
         }
+    }
+
+    // ========================================================================
+    // P0: Layer-specific Mutation Tests
+    // ========================================================================
+
+    // Internal test implementations for NIF functions
+    fn compute_layer_weight_counts_impl(topology: &[usize]) -> Vec<usize> {
+        if topology.len() < 2 {
+            return vec![];
+        }
+        topology.windows(2).map(|pair| pair[0] * pair[1]).collect()
+    }
+
+    fn tanh_batch_impl(values: &[f64]) -> Vec<f64> {
+        values.iter().map(|x| x.tanh()).collect()
+    }
+
+    fn sigmoid_batch_impl(values: &[f64]) -> Vec<f64> {
+        values.iter().map(|&x| {
+            let v = x.clamp(-10.0, 10.0);
+            1.0 / (1.0 + (-v).exp())
+        }).collect()
+    }
+
+    fn relu_batch_impl(values: &[f64]) -> Vec<f64> {
+        values.iter().map(|&x| x.max(0.0)).collect()
+    }
+
+    fn softmax_batch_impl(values: &[f64]) -> Vec<f64> {
+        if values.is_empty() {
+            return vec![];
+        }
+        let max_val = values.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+        let exp_values: Vec<f64> = values.iter().map(|&x| (x - max_val).exp()).collect();
+        let sum: f64 = exp_values.iter().sum();
+        if sum == 0.0 {
+            return vec![1.0 / values.len() as f64; values.len()];
+        }
+        exp_values.into_iter().map(|e| e / sum).collect()
+    }
+
+    fn hebbian_update_batch_impl(
+        weight_activities: &[(f64, f64, f64)],
+        learning_rate: f64,
+        decay_rate: f64,
+        max_weight: f64,
+    ) -> Vec<f64> {
+        weight_activities
+            .iter()
+            .map(|&(w, pre, post)| {
+                let dw = learning_rate * pre * post - decay_rate * w;
+                (w + dw).clamp(-max_weight, max_weight)
+            })
+            .collect()
+    }
+
+    fn modulated_hebbian_batch_impl(
+        weight_activities: &[(f64, f64, f64)],
+        learning_rate: f64,
+        reward: f64,
+        decay_rate: f64,
+        max_weight: f64,
+    ) -> Vec<f64> {
+        weight_activities
+            .iter()
+            .map(|&(w, pre, post)| {
+                let dw = learning_rate * reward * pre * post - decay_rate * w;
+                (w + dw).clamp(-max_weight, max_weight)
+            })
+            .collect()
+    }
+
+    fn stdp_update_impl(weight: f64, delta_t: f64, a_plus: f64, a_minus: f64, tau: f64) -> f64 {
+        let dw = if delta_t > 0.0 {
+            a_plus * (-delta_t / tau).exp()
+        } else {
+            -a_minus * (delta_t / tau).exp()
+        };
+        weight + dw
+    }
+
+    fn oja_update_batch_impl(
+        weight_activities: &[(f64, f64, f64)],
+        learning_rate: f64,
+        decay_rate: f64,
+        max_weight: f64,
+    ) -> Vec<f64> {
+        weight_activities
+            .iter()
+            .map(|&(w, pre, post)| {
+                let dw = learning_rate * (post * pre - post * post * w) - decay_rate * w;
+                (w + dw).clamp(-max_weight, max_weight)
+            })
+            .collect()
+    }
+
+    fn evaluate_cfc_sequence_impl(
+        inputs: &[f64],
+        initial_state: f64,
+        tau: f64,
+        bound: f64,
+        backbone_weights: &[f64],
+    ) -> Vec<(f64, f64)> {
+        let mut state = initial_state;
+        inputs
+            .iter()
+            .map(|&input| {
+                let (new_state, output) = evaluate_cfc_impl(input, state, tau, bound, backbone_weights, &[]);
+                state = new_state;
+                (new_state, output)
+            })
+            .collect()
+    }
+
+    fn ltc_state_batch_impl(inputs: &[f64], states: &[f64], taus: &[f64], dt: f64) -> Vec<f64> {
+        inputs
+            .iter()
+            .zip(states.iter())
+            .zip(taus.iter())
+            .map(|((&input, &state), &tau)| {
+                let (new_state, _) = evaluate_ode_impl(input, state, tau, 1.0, dt, &[], &[]);
+                new_state
+            })
+            .collect()
+    }
+
+    fn population_diversity_impl(population: &[Vec<f64>]) -> (f64, f64, f64, f64) {
+        let n = population.len();
+        if n < 2 {
+            return (0.0, 0.0, 0.0, 0.0);
+        }
+        let mut distances: Vec<f64> = Vec::with_capacity(n * (n - 1) / 2);
+        for i in 0..n {
+            for j in (i + 1)..n {
+                let dist: f64 = population[i]
+                    .iter()
+                    .zip(population[j].iter())
+                    .map(|(a, b)| (a - b) * (a - b))
+                    .sum::<f64>()
+                    .sqrt();
+                distances.push(dist);
+            }
+        }
+        if distances.is_empty() {
+            return (0.0, 0.0, 0.0, 0.0);
+        }
+        let min_dist = distances.iter().cloned().fold(f64::INFINITY, f64::min);
+        let max_dist = distances.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+        let mean_dist = distances.iter().sum::<f64>() / distances.len() as f64;
+        let variance = distances.iter().map(|d| (d - mean_dist) * (d - mean_dist)).sum::<f64>() / distances.len() as f64;
+        (mean_dist, variance.sqrt(), min_dist, max_dist)
+    }
+
+    fn weight_covariance_matrix_impl(population: &[Vec<f64>]) -> Vec<f64> {
+        if population.is_empty() || population[0].is_empty() {
+            return vec![];
+        }
+        let n = population.len() as f64;
+        let dim = population[0].len();
+        let mut means = vec![0.0; dim];
+        for genome in population {
+            for (i, &w) in genome.iter().enumerate() {
+                means[i] += w / n;
+            }
+        }
+        let mut cov = vec![0.0; dim * dim];
+        for genome in population {
+            for i in 0..dim {
+                for j in 0..dim {
+                    cov[i * dim + j] += (genome[i] - means[i]) * (genome[j] - means[j]) / n;
+                }
+            }
+        }
+        cov
+    }
+
+    fn pairwise_distances_batch_impl(population: &[Vec<f64>], use_l2: bool) -> Vec<f64> {
+        let n = population.len();
+        let mut distances: Vec<f64> = Vec::with_capacity(n * (n - 1) / 2);
+        for i in 0..n {
+            for j in (i + 1)..n {
+                let dist = if use_l2 {
+                    population[i].iter().zip(population[j].iter())
+                        .map(|(a, b)| (a - b) * (a - b))
+                        .sum::<f64>()
+                        .sqrt()
+                } else {
+                    population[i].iter().zip(population[j].iter())
+                        .map(|(a, b)| (a - b).abs())
+                        .sum()
+                };
+                distances.push(dist);
+            }
+        }
+        distances
+    }
+
+    fn count_excess_disjoint_impl(
+        genome_a: &[(i64, f64, bool)],
+        genome_b: &[(i64, f64, bool)],
+    ) -> (usize, usize, usize) {
+        let innovations_a: std::collections::HashSet<i64> = genome_a.iter().map(|&(i, _, _)| i).collect();
+        let innovations_b: std::collections::HashSet<i64> = genome_b.iter().map(|&(i, _, _)| i).collect();
+        let max_a = innovations_a.iter().max().copied().unwrap_or(0);
+        let max_b = innovations_b.iter().max().copied().unwrap_or(0);
+        let threshold = max_a.min(max_b);
+        let mut excess = 0;
+        let mut disjoint = 0;
+        let mut matching = 0;
+        for &innov in &innovations_a {
+            if innovations_b.contains(&innov) {
+                matching += 1;
+            } else if innov > threshold {
+                excess += 1;
+            } else {
+                disjoint += 1;
+            }
+        }
+        for &innov in &innovations_b {
+            if !innovations_a.contains(&innov) {
+                if innov > threshold { excess += 1; } else { disjoint += 1; }
+            }
+        }
+        (excess, disjoint, matching)
+    }
+
+    fn assign_species_batch_impl(
+        genomes: &[Vec<f64>],
+        representatives: &[Vec<f64>],
+        threshold: f64,
+    ) -> Vec<usize> {
+        genomes.iter().map(|genome| {
+            let mut best_species = representatives.len();
+            let mut best_dist = threshold;
+            for (species_idx, rep) in representatives.iter().enumerate() {
+                let dist: f64 = genome.iter().zip(rep.iter())
+                    .map(|(a, b)| (a - b) * (a - b))
+                    .sum::<f64>()
+                    .sqrt();
+                if dist < best_dist {
+                    best_dist = dist;
+                    best_species = species_idx;
+                }
+            }
+            best_species
+        }).collect()
+    }
+
+    fn kmeans_cluster_impl(genomes: &[Vec<f64>], k: usize, max_iterations: usize) -> Vec<usize> {
+        if genomes.is_empty() || k == 0 {
+            return vec![];
+        }
+        let n = genomes.len();
+        let dim = genomes[0].len();
+        let k = k.min(n);
+        let mut rng = StdRng::seed_from_u64(42); // Use seeded RNG for reproducibility in tests
+        let mut centroid_indices: Vec<usize> = (0..n).collect();
+        centroid_indices.shuffle(&mut rng);
+        let mut centroids: Vec<Vec<f64>> = centroid_indices[..k].iter().map(|&i| genomes[i].clone()).collect();
+        let mut assignments = vec![0usize; n];
+        for _ in 0..max_iterations {
+            let mut changed = false;
+            for (i, genome) in genomes.iter().enumerate() {
+                let best_cluster = centroids.iter().enumerate()
+                    .map(|(c_idx, centroid)| {
+                        let dist: f64 = genome.iter().zip(centroid.iter()).map(|(a, b)| (a - b) * (a - b)).sum();
+                        (c_idx, dist)
+                    })
+                    .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
+                    .map(|(idx, _)| idx)
+                    .unwrap_or(0);
+                if assignments[i] != best_cluster {
+                    assignments[i] = best_cluster;
+                    changed = true;
+                }
+            }
+            if !changed { break; }
+            for c_idx in 0..k {
+                let members: Vec<&Vec<f64>> = genomes.iter().enumerate()
+                    .filter(|(i, _)| assignments[*i] == c_idx)
+                    .map(|(_, g)| g)
+                    .collect();
+                if !members.is_empty() {
+                    let count = members.len() as f64;
+                    for d in 0..dim {
+                        centroids[c_idx][d] = members.iter().map(|g| g[d]).sum::<f64>() / count;
+                    }
+                }
+            }
+        }
+        assignments
+    }
+
+    #[test]
+    fn test_compute_layer_weight_counts() {
+        let topology = vec![3, 4, 2];
+        let counts = compute_layer_weight_counts_impl(&topology);
+        assert_eq!(counts, vec![12, 8]);
+    }
+
+    #[test]
+    fn test_compute_layer_weight_counts_single_layer() {
+        let topology = vec![5, 3];
+        let counts = compute_layer_weight_counts_impl(&topology);
+        assert_eq!(counts, vec![15]);
+    }
+
+    #[test]
+    fn test_compute_layer_weight_counts_deep() {
+        let topology = vec![10, 20, 15, 10, 5];
+        let counts = compute_layer_weight_counts_impl(&topology);
+        assert_eq!(counts, vec![200, 300, 150, 50]);
+    }
+
+    #[test]
+    fn test_mutate_weights_layered_no_mutation() {
+        let weights = vec![0.1, 0.2, 0.3, 0.4, 0.5];
+        // Test with internal mutate_single_weight with 0 mutation rate
+        let mut rng = StdRng::seed_from_u64(42);
+        let result: Vec<f64> = weights.iter()
+            .map(|&w| mutate_single_weight(w, 0.0, 0.9, 0.1, &mut rng))
+            .collect();
+        for (original, mutated) in weights.iter().zip(result.iter()) {
+            assert!((original - mutated).abs() < 1e-10);
+        }
+    }
+
+    // ========================================================================
+    // P0: SIMD Batch Activation Tests
+    // ========================================================================
+
+    #[test]
+    fn test_tanh_batch_values() {
+        let values = vec![0.0, 1.0, -1.0, 0.5, -0.5];
+        let result = tanh_batch_impl(&values);
+        for (v, r) in values.iter().zip(result.iter()) {
+            assert!((v.tanh() - r).abs() < 1e-10);
+        }
+    }
+
+    #[test]
+    fn test_sigmoid_batch_values() {
+        let values = vec![0.0, 1.0, -1.0, 5.0, -5.0];
+        let result = sigmoid_batch_impl(&values);
+        assert!((result[0] - 0.5).abs() < 1e-10);
+        assert!(result[1] > 0.5);
+        assert!(result[2] < 0.5);
+        assert!(result[3] > 0.99);
+        assert!(result[4] < 0.01);
+    }
+
+    #[test]
+    fn test_relu_batch_values() {
+        let values = vec![0.0, 1.0, -1.0, 0.5, -0.5];
+        let result = relu_batch_impl(&values);
+        assert!((result[0] - 0.0).abs() < 1e-10);
+        assert!((result[1] - 1.0).abs() < 1e-10);
+        assert!((result[2] - 0.0).abs() < 1e-10);
+        assert!((result[3] - 0.5).abs() < 1e-10);
+        assert!((result[4] - 0.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_softmax_batch_values() {
+        let values = vec![1.0, 2.0, 3.0];
+        let result = softmax_batch_impl(&values);
+        let sum: f64 = result.iter().sum();
+        assert!((sum - 1.0).abs() < 1e-10);
+        assert!(result[2] > result[1]);
+        assert!(result[1] > result[0]);
+    }
+
+    #[test]
+    fn test_softmax_batch_uniform() {
+        let values = vec![1.0, 1.0, 1.0];
+        let result = softmax_batch_impl(&values);
+        for r in &result {
+            assert!((r - 1.0/3.0).abs() < 1e-10);
+        }
+    }
+
+    // ========================================================================
+    // P1: Plasticity Tests
+    // ========================================================================
+
+    #[test]
+    fn test_hebbian_update_basic() {
+        let activities = vec![(0.0, 1.0, 1.0)];
+        let result = hebbian_update_batch_impl(&activities, 0.1, 0.0, 1.0);
+        assert!(result[0] > 0.0);
+        assert!((result[0] - 0.1).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_hebbian_update_with_decay() {
+        let activities = vec![(0.5, 0.0, 0.0)];
+        let result = hebbian_update_batch_impl(&activities, 0.1, 0.1, 1.0);
+        assert!(result[0] < 0.5);
+        assert!((result[0] - 0.45).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_modulated_hebbian_positive_reward() {
+        let activities = vec![(0.0, 1.0, 1.0)];
+        let result_positive = modulated_hebbian_batch_impl(&activities, 0.1, 1.0, 0.0, 1.0);
+        let result_negative = modulated_hebbian_batch_impl(&activities, 0.1, -1.0, 0.0, 1.0);
+        assert!(result_positive[0] > 0.0);
+        assert!(result_negative[0] < 0.0);
+    }
+
+    #[test]
+    fn test_stdp_potentiation() {
+        let weight = 0.5;
+        let result = stdp_update_impl(weight, 5.0, 0.1, 0.1, 20.0);
+        assert!(result > weight);
+    }
+
+    #[test]
+    fn test_stdp_depression() {
+        let weight = 0.5;
+        let result = stdp_update_impl(weight, -5.0, 0.1, 0.1, 20.0);
+        assert!(result < weight);
+    }
+
+    #[test]
+    fn test_oja_update_normalization() {
+        let activities = vec![(1.0, 1.0, 1.0)];
+        let result = oja_update_batch_impl(&activities, 0.1, 0.0, 2.0);
+        assert!((result[0] - 1.0).abs() < 1e-10);
+    }
+
+    // ========================================================================
+    // P1: Time Series LTC/CfC Tests
+    // ========================================================================
+
+    #[test]
+    fn test_evaluate_cfc_sequence() {
+        let inputs = vec![0.5, 0.5, 0.5, 0.5, 0.5];
+        let result = evaluate_cfc_sequence_impl(&inputs, 0.0, 1.0, 1.0, &[]);
+        assert_eq!(result.len(), 5);
+        let last_state = result[4].0;
+        let second_last = result[3].0;
+        assert!((last_state - second_last).abs() < 0.1);
+    }
+
+    #[test]
+    fn test_ltc_state_batch() {
+        let inputs = vec![0.5, 0.3, 0.7];
+        let states = vec![0.0, 0.0, 0.0];
+        let taus = vec![1.0, 1.0, 1.0];
+        let result = ltc_state_batch_impl(&inputs, &states, &taus, 0.1);
+        assert_eq!(result.len(), 3);
+        for state in &result {
+            assert!(*state != 0.0);
+        }
+    }
+
+    // ========================================================================
+    // P1: Population Diversity Tests
+    // ========================================================================
+
+    #[test]
+    fn test_population_diversity_identical() {
+        let population = vec![
+            vec![0.5, 0.5, 0.5],
+            vec![0.5, 0.5, 0.5],
+            vec![0.5, 0.5, 0.5],
+        ];
+        let (mean, std, min, max) = population_diversity_impl(&population);
+        assert!((mean).abs() < 1e-10);
+        assert!((std).abs() < 1e-10);
+        assert!((min).abs() < 1e-10);
+        assert!((max).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_population_diversity_varied() {
+        let population = vec![
+            vec![0.0, 0.0, 0.0],
+            vec![1.0, 0.0, 0.0],
+            vec![0.0, 1.0, 0.0],
+        ];
+        let (mean, std, min, max) = population_diversity_impl(&population);
+        assert!(mean > 0.0);
+        assert!(min <= mean);
+        assert!(max >= mean);
+    }
+
+    #[test]
+    fn test_weight_covariance_matrix_size() {
+        let population = vec![
+            vec![0.1, 0.2, 0.3],
+            vec![0.4, 0.5, 0.6],
+            vec![0.7, 0.8, 0.9],
+        ];
+        let cov = weight_covariance_matrix_impl(&population);
+        assert_eq!(cov.len(), 9);
+    }
+
+    #[test]
+    fn test_pairwise_distances_batch() {
+        let population = vec![
+            vec![0.0, 0.0],
+            vec![1.0, 0.0],
+            vec![0.0, 1.0],
+        ];
+        let distances = pairwise_distances_batch_impl(&population, true);
+        assert_eq!(distances.len(), 3);
+        for d in &distances {
+            assert!((d - 1.0).abs() < 1e-10);
+        }
+    }
+
+    // ========================================================================
+    // P2: NEAT Crossover Tests
+    // ========================================================================
+
+    #[test]
+    fn test_count_excess_disjoint_matching() {
+        let genome_a = vec![(1, 0.5, true), (2, 0.3, true), (3, 0.7, true)];
+        let genome_b = vec![(1, 0.4, true), (2, 0.2, true), (3, 0.8, true)];
+        let (excess, disjoint, matching) = count_excess_disjoint_impl(&genome_a, &genome_b);
+        assert_eq!(matching, 3);
+        assert_eq!(excess, 0);
+        assert_eq!(disjoint, 0);
+    }
+
+    #[test]
+    fn test_count_excess_disjoint_excess() {
+        let genome_a = vec![(1, 0.5, true), (2, 0.3, true), (5, 0.7, true)];
+        let genome_b = vec![(1, 0.4, true), (2, 0.2, true)];
+        let (excess, disjoint, matching) = count_excess_disjoint_impl(&genome_a, &genome_b);
+        assert_eq!(matching, 2);
+        assert_eq!(excess, 1);
+        assert_eq!(disjoint, 0);
+    }
+
+    #[test]
+    fn test_count_excess_disjoint_disjoint() {
+        let genome_a = vec![(1, 0.5, true), (3, 0.3, true), (5, 0.7, true)];
+        let genome_b = vec![(1, 0.4, true), (4, 0.2, true), (5, 0.8, true)];
+        let (excess, disjoint, matching) = count_excess_disjoint_impl(&genome_a, &genome_b);
+        assert_eq!(matching, 2);
+        assert_eq!(excess, 0);
+        assert_eq!(disjoint, 2);
+    }
+
+    // ========================================================================
+    // P2: Speciation Clustering Tests
+    // ========================================================================
+
+    #[test]
+    fn test_assign_species_batch_exact_match() {
+        let genomes = vec![vec![0.0, 0.0], vec![1.0, 1.0]];
+        let representatives = vec![vec![0.0, 0.0], vec![1.0, 1.0]];
+        let assignments = assign_species_batch_impl(&genomes, &representatives, 0.5);
+        assert_eq!(assignments[0], 0);
+        assert_eq!(assignments[1], 1);
+    }
+
+    #[test]
+    fn test_assign_species_batch_new_species() {
+        let genomes = vec![vec![5.0, 5.0]];
+        let representatives = vec![vec![0.0, 0.0]];
+        let assignments = assign_species_batch_impl(&genomes, &representatives, 0.5);
+        assert_eq!(assignments[0], 1);
+    }
+
+    #[test]
+    fn test_kmeans_cluster_k2() {
+        let genomes = vec![
+            vec![0.0, 0.0],
+            vec![0.1, 0.1],
+            vec![10.0, 10.0],
+            vec![10.1, 10.1],
+        ];
+        let assignments = kmeans_cluster_impl(&genomes, 2, 100);
+        assert_eq!(assignments[0], assignments[1]);
+        assert_eq!(assignments[2], assignments[3]);
+        assert_ne!(assignments[0], assignments[2]);
+    }
+
+    // ========================================================================
+    // P3: Matrix Operations Tests
+    // ========================================================================
+
+    #[test]
+    fn test_matmul_add_bias_simple() {
+        let x = vec![1.0, 2.0];
+        let w = vec![1.0, 0.0, 0.0, 1.0];
+        let b = vec![0.0, 0.0];
+        let result = matmul_add_bias_impl(&x, &w, &b);
+        assert_eq!(result.len(), 2);
+        assert!((result[0] - 1.0).abs() < 1e-10);
+        assert!((result[1] - 2.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_matmul_add_bias_with_bias() {
+        let x = vec![1.0, 1.0];
+        let w = vec![1.0, 1.0, 1.0, 1.0];
+        let b = vec![1.0, 2.0];
+        let result = matmul_add_bias_impl(&x, &w, &b);
+        assert_eq!(result.len(), 2);
+        assert!((result[0] - 3.0).abs() < 1e-10);
+        assert!((result[1] - 4.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_matmul_different_sizes() {
+        let x = vec![1.0, 2.0, 3.0];
+        let w = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
+        let b = vec![0.0, 0.0];
+        let result = matmul_add_bias_impl(&x, &w, &b);
+        assert_eq!(result.len(), 2);
+        assert!((result[0] - 22.0).abs() < 1e-10);
+        assert!((result[1] - 28.0).abs() < 1e-10);
     }
 }

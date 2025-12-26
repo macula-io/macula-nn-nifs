@@ -499,3 +499,490 @@ compatibility_distance_test_() ->
             ?assert(Distance > 0.0)
         end}
     ]}.
+
+%%==============================================================================
+%% P0: Layer-specific Mutation Tests
+%%==============================================================================
+
+mutate_weights_layered_test_() ->
+    {setup, fun setup/0, [
+        {"applies different rates to reservoir vs readout", fun() ->
+            %% 10 weights: 6 reservoir, 4 readout
+            Weights = [0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5],
+            Mutated = macula_nn_nifs:mutate_weights_layered(
+                Weights, 6,
+                1.0, 0.1,  %% reservoir: full mutation rate, low strength
+                1.0, 0.5   %% readout: full mutation rate, high strength
+            ),
+            ?assertEqual(10, length(Mutated))
+        end},
+        {"preserves weights with zero mutation rate", fun() ->
+            Weights = [0.1, 0.2, 0.3, 0.4, 0.5],
+            Mutated = macula_nn_nifs:mutate_weights_layered(
+                Weights, 3,
+                0.0, 0.1,  %% reservoir: no mutation
+                0.0, 0.1   %% readout: no mutation
+            ),
+            ?assertEqual(Weights, Mutated)
+        end}
+    ]}.
+
+compute_layer_weight_counts_test_() ->
+    {setup, fun setup/0, [
+        {"counts weights per layer correctly", fun() ->
+            %% Simple network: 2 inputs -> 2 hidden (4 weights) -> 1 output (2 weights)
+            LayerSizes = [2, 2, 1],
+            Counts = macula_nn_nifs:compute_layer_weight_counts(LayerSizes),
+            ?assertEqual([4, 2], Counts)
+        end},
+        {"handles single layer", fun() ->
+            Counts = macula_nn_nifs:compute_layer_weight_counts([5]),
+            ?assertEqual([], Counts)
+        end}
+    ]}.
+
+%%==============================================================================
+%% P0: SIMD Batch Activations Tests
+%%==============================================================================
+
+tanh_batch_test_() ->
+    {setup, fun setup/0, [
+        {"applies tanh to all values", fun() ->
+            Values = [0.0, 1.0, -1.0, 2.0, -2.0],
+            Results = macula_nn_nifs:tanh_batch(Values),
+            ?assertEqual(5, length(Results)),
+            %% tanh(0) = 0
+            [R1 | _] = Results,
+            ?assert(abs(R1) < 0.001)
+        end},
+        {"values in range [-1, 1]", fun() ->
+            Values = [100.0, -100.0, 0.5, -0.5],
+            Results = macula_nn_nifs:tanh_batch(Values),
+            ?assert(lists:all(fun(R) -> R >= -1.0 andalso R =< 1.0 end, Results))
+        end}
+    ]}.
+
+sigmoid_batch_test_() ->
+    {setup, fun setup/0, [
+        {"applies sigmoid to all values", fun() ->
+            Values = [0.0, 1.0, -1.0],
+            Results = macula_nn_nifs:sigmoid_batch(Values),
+            ?assertEqual(3, length(Results)),
+            %% sigmoid(0) = 0.5
+            [R1 | _] = Results,
+            ?assert(abs(R1 - 0.5) < 0.001)
+        end},
+        {"values in range [0, 1]", fun() ->
+            Values = [100.0, -100.0, 0.5, -0.5],
+            Results = macula_nn_nifs:sigmoid_batch(Values),
+            ?assert(lists:all(fun(R) -> R >= 0.0 andalso R =< 1.0 end, Results))
+        end}
+    ]}.
+
+relu_batch_test_() ->
+    {setup, fun setup/0, [
+        {"applies ReLU to all values", fun() ->
+            Values = [1.0, -1.0, 0.0, 2.0, -2.0],
+            Results = macula_nn_nifs:relu_batch(Values),
+            ?assertEqual([1.0, 0.0, 0.0, 2.0, 0.0], Results)
+        end}
+    ]}.
+
+softmax_batch_test_() ->
+    {setup, fun setup/0, [
+        {"outputs sum to 1.0", fun() ->
+            Values = [1.0, 2.0, 3.0],
+            Results = macula_nn_nifs:softmax_batch(Values),
+            Sum = lists:sum(Results),
+            ?assert(abs(Sum - 1.0) < 0.001)
+        end},
+        {"all values non-negative", fun() ->
+            Values = [-1.0, 0.0, 1.0],
+            Results = macula_nn_nifs:softmax_batch(Values),
+            ?assert(lists:all(fun(R) -> R >= 0.0 end, Results))
+        end}
+    ]}.
+
+activation_batch_test_() ->
+    {setup, fun setup/0, [
+        {"tanh activation works", fun() ->
+            Values = [0.0, 1.0],
+            Results = macula_nn_nifs:activation_batch(Values, tanh),
+            ?assertEqual(2, length(Results))
+        end},
+        {"sigmoid activation works", fun() ->
+            Values = [0.0, 1.0],
+            Results = macula_nn_nifs:activation_batch(Values, sigmoid),
+            [R1 | _] = Results,
+            ?assert(abs(R1 - 0.5) < 0.001)
+        end},
+        {"relu activation works", fun() ->
+            Values = [1.0, -1.0],
+            Results = macula_nn_nifs:activation_batch(Values, relu),
+            ?assertEqual([1.0, 0.0], Results)
+        end}
+    ]}.
+
+%%==============================================================================
+%% P1: Plasticity Computation Tests
+%%==============================================================================
+
+hebbian_update_batch_test_() ->
+    {setup, fun setup/0, [
+        {"computes Hebbian weight updates", fun() ->
+            %% (weight, pre_activity, post_activity)
+            WeightActivities = [{0.5, 0.8, 0.9}, {0.3, 0.1, 0.2}],
+            LearningRate = 0.01,
+            DecayRate = 0.001,
+            MaxWeight = 1.0,
+            Results = macula_nn_nifs:hebbian_update_batch(
+                WeightActivities, LearningRate, DecayRate, MaxWeight
+            ),
+            ?assertEqual(2, length(Results)),
+            ?assert(lists:all(fun(R) -> is_float(R) end, Results))
+        end}
+    ]}.
+
+modulated_hebbian_batch_test_() ->
+    {setup, fun setup/0, [
+        {"computes modulated Hebbian updates", fun() ->
+            WeightActivities = [{0.5, 0.8, 0.9}, {0.3, 0.1, 0.2}],
+            LearningRate = 0.01,
+            Reward = 0.5,
+            DecayRate = 0.001,
+            MaxWeight = 1.0,
+            Results = macula_nn_nifs:modulated_hebbian_batch(
+                WeightActivities, LearningRate, Reward, DecayRate, MaxWeight
+            ),
+            ?assertEqual(2, length(Results))
+        end},
+        {"zero reward prevents learning", fun() ->
+            WeightActivities = [{0.5, 1.0, 1.0}],
+            Results = macula_nn_nifs:modulated_hebbian_batch(
+                WeightActivities, 0.1, 0.0, 0.0, 1.0
+            ),
+            [R] = Results,
+            ?assert(abs(R - 0.5) < 0.01)  %% Should be near original weight
+        end}
+    ]}.
+
+stdp_update_test_() ->
+    {setup, fun setup/0, [
+        {"pre-before-post strengthens", fun() ->
+            Weight = 0.5,
+            DeltaT = 10.0,  %% Post fires 10ms after pre (positive = LTP)
+            Aplus = 0.1,
+            Aminus = 0.1,
+            Tau = 20.0,
+            NewWeight = macula_nn_nifs:stdp_update(Weight, DeltaT, Aplus, Aminus, Tau),
+            ?assert(NewWeight >= Weight)  %% LTP
+        end},
+        {"post-before-pre weakens", fun() ->
+            Weight = 0.5,
+            DeltaT = -10.0,  %% Pre fires 10ms after post (negative = LTD)
+            Aplus = 0.1,
+            Aminus = 0.1,
+            Tau = 20.0,
+            NewWeight = macula_nn_nifs:stdp_update(Weight, DeltaT, Aplus, Aminus, Tau),
+            ?assert(NewWeight =< Weight)  %% LTD
+        end}
+    ]}.
+
+oja_update_batch_test_() ->
+    {setup, fun setup/0, [
+        {"computes Oja rule updates", fun() ->
+            WeightActivities = [{0.5, 0.8, 0.9}, {0.3, 0.1, 0.2}],
+            LearningRate = 0.01,
+            Results = macula_nn_nifs:oja_update_batch(WeightActivities, LearningRate, 0.0, 1.0),
+            ?assertEqual(2, length(Results))
+        end}
+    ]}.
+
+%%==============================================================================
+%% P1: Time Series LTC/CfC Tests
+%%==============================================================================
+
+evaluate_cfc_sequence_test_() ->
+    {setup, fun setup/0, [
+        {"processes sequence of inputs", fun() ->
+            Inputs = [0.1, 0.2, 0.3, 0.4, 0.5],
+            InitState = 0.0,
+            Tau = 1.0,
+            Bound = 1.0,
+            BackboneWeights = [],
+            Results = macula_nn_nifs:evaluate_cfc_sequence(Inputs, InitState, Tau, Bound, BackboneWeights),
+            ?assertEqual(5, length(Results))
+        end},
+        {"returns state and output tuples", fun() ->
+            Inputs = [0.1, 0.2, 0.3],
+            Results = macula_nn_nifs:evaluate_cfc_sequence(Inputs, 0.0, 1.0, 1.0, []),
+            ?assertEqual(3, length(Results)),
+            ?assert(lists:all(fun({S, O}) -> is_float(S) andalso is_float(O) end, Results))
+        end}
+    ]}.
+
+evaluate_cfc_parallel_test_() ->
+    {setup, fun setup/0, [
+        {"evaluates multiple neurons in parallel", fun() ->
+            Input = 0.5,
+            %% NeuronParams: list of {state, tau, bound}
+            NeuronParams = [{0.0, 1.0, 1.0}, {0.1, 2.0, 0.5}],
+            BackboneWeights = [],
+            HeadWeights = [],
+            Results = macula_nn_nifs:evaluate_cfc_parallel(Input, NeuronParams, BackboneWeights, HeadWeights),
+            ?assertEqual(2, length(Results))
+        end}
+    ]}.
+
+ltc_state_batch_test_() ->
+    {setup, fun setup/0, [
+        {"computes LTC state updates", fun() ->
+            Inputs = [0.5, 0.7],
+            States = [0.0, 0.1],
+            Taus = [1.0, 2.0],
+            Dt = 0.01,
+            Results = macula_nn_nifs:ltc_state_batch(Inputs, States, Taus, Dt),
+            ?assertEqual(2, length(Results))
+        end}
+    ]}.
+
+%%==============================================================================
+%% P1: Population Diversity Tests
+%%==============================================================================
+
+population_diversity_test_() ->
+    {setup, fun setup/0, [
+        {"computes diversity metrics", fun() ->
+            Population = [[0.1, 0.2], [0.3, 0.4], [0.5, 0.6]],
+            {MeanDist, StdDist, MinDist, MaxDist} = macula_nn_nifs:population_diversity(Population),
+            ?assert(is_float(MeanDist)),
+            ?assert(is_float(StdDist)),
+            ?assert(is_float(MinDist)),
+            ?assert(is_float(MaxDist)),
+            ?assert(MaxDist >= MinDist)
+        end},
+        {"identical population has zero diversity", fun() ->
+            Population = [[0.5, 0.5], [0.5, 0.5], [0.5, 0.5]],
+            {MeanDist, StdDist, MinDist, MaxDist} = macula_nn_nifs:population_diversity(Population),
+            ?assertEqual(0.0, MeanDist),
+            ?assertEqual(0.0, StdDist),
+            ?assertEqual(0.0, MinDist),
+            ?assertEqual(0.0, MaxDist)
+        end}
+    ]}.
+
+weight_covariance_matrix_test_() ->
+    {setup, fun setup/0, [
+        {"computes covariance matrix", fun() ->
+            Population = [[0.1, 0.2, 0.3], [0.4, 0.5, 0.6], [0.7, 0.8, 0.9]],
+            CovMatrix = macula_nn_nifs:weight_covariance_matrix(Population),
+            %% 3x3 covariance matrix = 9 elements (flattened row-major)
+            ?assertEqual(9, length(CovMatrix)),
+            ?assert(lists:all(fun(V) -> is_float(V) end, CovMatrix))
+        end}
+    ]}.
+
+pairwise_distances_batch_test_() ->
+    {setup, fun setup/0, [
+        {"computes pairwise L2 distances", fun() ->
+            Genomes = [[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]],
+            Distances = macula_nn_nifs:pairwise_distances_batch(Genomes, l2),
+            %% N*(N-1)/2 = 3*2/2 = 3 pairs
+            ?assertEqual(3, length(Distances))
+        end},
+        {"computes pairwise L1 distances", fun() ->
+            Genomes = [[0.0, 0.0], [1.0, 1.0]],
+            Distances = macula_nn_nifs:pairwise_distances_batch(Genomes, l1),
+            ?assertEqual(1, length(Distances)),
+            %% L1 distance between [0,0] and [1,1] = 2.0
+            [D] = Distances,
+            ?assertEqual(2.0, D)
+        end}
+    ]}.
+
+%%==============================================================================
+%% P2: NEAT Crossover Tests
+%%==============================================================================
+
+neat_crossover_test_() ->
+    {setup, fun setup/0, [
+        {"crosses over matching genes", fun() ->
+            %% Parent A genes: {innovation_number, weight, enabled}
+            ParentA = [{1, 0.5, true}, {2, 0.3, true}, {3, 0.7, true}],
+            %% Parent B genes (same innovations)
+            ParentB = [{1, 0.6, true}, {2, 0.4, true}, {3, 0.8, true}],
+            Offspring = macula_nn_nifs:neat_crossover(ParentA, ParentB, 1.0, 1.0),
+            ?assertEqual(3, length(Offspring)),
+            %% Each gene is {innov, weight, enabled}
+            ?assert(lists:all(fun({I, W, E}) ->
+                is_integer(I) andalso is_float(W) andalso is_boolean(E)
+            end, Offspring))
+        end},
+        {"includes excess/disjoint from fitter parent", fun() ->
+            %% Fitter parent has extra genes
+            ParentA = [{1, 0.5, true}, {2, 0.3, true}, {4, 0.9, true}],
+            ParentB = [{1, 0.6, true}, {3, 0.7, true}],
+            Offspring = macula_nn_nifs:neat_crossover(ParentA, ParentB, 10.0, 5.0),
+            %% Fitter parent A (fitness 10) contributes disjoint/excess
+            %% Should have innovations 1, 2, 4 from A, plus 3 from A or B
+            ?assert(length(Offspring) >= 3)
+        end}
+    ]}.
+
+align_genes_by_innovation_test_() ->
+    {setup, fun setup/0, [
+        {"aligns genes by innovation number", fun() ->
+            %% Genes must be 3-tuples: {innovation, weight, enabled}
+            GenesA = [{1, 0.5, true}, {2, 0.3, true}, {4, 0.9, true}],
+            GenesB = [{1, 0.6, true}, {3, 0.7, true}, {4, 0.8, true}],
+            Aligned = macula_nn_nifs:align_genes_by_innovation(GenesA, GenesB),
+            %% Returns list of {GeneA | nil, GeneB | nil} for each innovation
+            %% Innovations 1, 2, 3, 4 = 4 entries
+            ?assertEqual(4, length(Aligned)),
+            %% Each entry is {A, B} where A/B is gene tuple or nil
+            ?assert(lists:all(fun({A, B}) ->
+                (A == nil orelse is_tuple(A)) andalso
+                (B == nil orelse is_tuple(B))
+            end, Aligned))
+        end}
+    ]}.
+
+count_excess_disjoint_test_() ->
+    {setup, fun setup/0, [
+        {"counts excess and disjoint genes", fun() ->
+            %% Genes must be 3-tuples: {innovation, weight, enabled}
+            GenesA = [{1, 0.5, true}, {2, 0.3, true}, {5, 0.9, true}],
+            GenesB = [{1, 0.6, true}, {3, 0.7, true}],
+            {Excess, Disjoint, Matching} = macula_nn_nifs:count_excess_disjoint(GenesA, GenesB),
+            ?assert(is_integer(Excess)),
+            ?assert(is_integer(Disjoint)),
+            ?assert(is_integer(Matching)),
+            ?assert(Excess >= 0),
+            ?assert(Disjoint >= 0),
+            %% Innovation 1 is matching
+            ?assertEqual(1, Matching)
+        end}
+    ]}.
+
+%%==============================================================================
+%% P2: Speciation Clustering Tests
+%%==============================================================================
+
+assign_species_batch_test_() ->
+    {setup, fun setup/0, [
+        {"assigns genomes to species", fun() ->
+            Genomes = [[0.1, 0.2], [0.15, 0.25], [0.9, 0.8], [0.85, 0.75]],
+            Representatives = [[0.1, 0.2], [0.9, 0.8]],
+            Threshold = 0.5,
+            Assignments = macula_nn_nifs:assign_species_batch(
+                Genomes, Representatives, Threshold
+            ),
+            ?assertEqual(4, length(Assignments)),
+            %% Each assignment is a species index
+            ?assert(lists:all(fun(A) -> is_integer(A) andalso A >= 0 end, Assignments))
+        end}
+    ]}.
+
+find_representative_test_() ->
+    {setup, fun setup/0, [
+        {"finds representative closest to centroid", fun() ->
+            Members = [[0.0, 0.0], [1.0, 1.0], [0.4, 0.5]],
+            RepIdx = macula_nn_nifs:find_representative(Members, centroid),
+            ?assert(RepIdx >= 0),
+            ?assert(RepIdx < 3)
+        end},
+        {"handles single member", fun() ->
+            Members = [[0.5, 0.5]],
+            RepIdx = macula_nn_nifs:find_representative(Members, centroid),
+            ?assertEqual(0, RepIdx)
+        end}
+    ]}.
+
+kmeans_cluster_test_() ->
+    {setup, fun setup/0, [
+        {"clusters genomes into k groups", fun() ->
+            Genomes = [
+                [0.1, 0.1], [0.15, 0.12], [0.08, 0.11],  %% Cluster 1
+                [0.9, 0.9], [0.88, 0.91], [0.92, 0.87]   %% Cluster 2
+            ],
+            Assignments = macula_nn_nifs:kmeans_cluster(Genomes, 2, 100),
+            ?assertEqual(6, length(Assignments)),
+            %% All assignments should be 0 or 1 (2 clusters)
+            ?assert(lists:all(fun(A) -> A == 0 orelse A == 1 end, Assignments))
+        end},
+        {"handles k=1", fun() ->
+            Genomes = [[0.1, 0.1], [0.9, 0.9]],
+            Assignments = macula_nn_nifs:kmeans_cluster(Genomes, 1, 10),
+            ?assertEqual([0, 0], Assignments)
+        end}
+    ]}.
+
+%%==============================================================================
+%% P3: Matrix Operations Tests
+%%==============================================================================
+
+matmul_add_bias_test_() ->
+    {setup, fun setup/0, [
+        {"computes matrix multiplication with bias", fun() ->
+            %% X: 3-element input vector
+            %% W: flattened 3x2 weight matrix (input_dim=3 x output_dim=2, row-major)
+            %% B: 2-element bias vector
+            Input = [1.0, 1.0, 1.0],
+            %% Weights: 3 inputs x 2 outputs = 6 values
+            %% Column-major order for output: W[i * output_dim + j]
+            %% Row 0: [0.5, 1.0], Row 1: [0.5, 1.0], Row 2: [0.5, 1.0]
+            Weights = [0.5, 1.0, 0.5, 1.0, 0.5, 1.0],
+            Bias = [0.0, 1.0],
+            Result = macula_nn_nifs:matmul_add_bias(Input, Weights, Bias),
+            ?assertEqual(2, length(Result)),
+            %% First output: 0.5+0.5+0.5+0 = 1.5
+            %% Second output: 1+1+1+1 = 4.0
+            [R1, R2] = Result,
+            ?assert(abs(R1 - 1.5) < 0.001),
+            ?assert(abs(R2 - 4.0) < 0.001)
+        end}
+    ]}.
+
+layer_forward_test_() ->
+    {setup, fun setup/0, [
+        {"computes layer forward pass with activation", fun() ->
+            Input = [0.5, 0.5],
+            %% Flattened weights: 2 inputs x 1 output
+            Weights = [1.0, 1.0],
+            Bias = [0.0],
+            Result = macula_nn_nifs:layer_forward(Input, Weights, Bias, tanh),
+            ?assertEqual(1, length(Result)),
+            [R] = Result,
+            %% tanh(0.5+0.5) = tanh(1.0) ≈ 0.7616
+            ?assert(abs(R - 0.7616) < 0.01)
+        end}
+    ]}.
+
+multi_layer_forward_test_() ->
+    {setup, fun setup/0, [
+        {"computes multi-layer forward pass", fun() ->
+            Input = [0.5, 0.5],
+            %% Layers: [{flattened_weights, biases, activation}, ...]
+            %% Layer 1: 2 inputs -> 2 outputs (identity-ish)
+            %% Flattened weights for 2x2: [w11, w12, w21, w22]
+            Layer1 = {[1.0, 0.0, 0.0, 1.0], [0.0, 0.0], tanh},
+            %% Layer 2: 2 inputs -> 1 output (sum)
+            Layer2 = {[1.0, 1.0], [0.0], tanh},
+            Layers = [Layer1, Layer2],
+            LayerSizes = [2, 2, 1],
+            Result = macula_nn_nifs:multi_layer_forward(Input, Layers, LayerSizes),
+            ?assertEqual(1, length(Result))
+        end},
+        {"simple two-layer network", fun() ->
+            Input = [1.0, 0.0],
+            %% Layer 1: 2 inputs -> 1 output
+            Layer1 = {[1.0, 1.0], [0.0], tanh},
+            Layers = [Layer1],
+            LayerSizes = [2, 1],
+            Result = macula_nn_nifs:multi_layer_forward(Input, Layers, LayerSizes),
+            ?assertEqual(1, length(Result)),
+            [R] = Result,
+            %% tanh(1.0) ≈ 0.7616
+            ?assert(abs(R - 0.7616) < 0.01)
+        end}
+    ]}.
