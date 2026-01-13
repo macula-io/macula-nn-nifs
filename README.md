@@ -1,4 +1,5 @@
 # macula-nn-nifs
+[![Buy Me A Coffee](https://img.shields.io/badge/Buy%20Me%20A%20Coffee-support-yellow.svg)](https://buymeacoffee.com/beamologist)
 
 High-performance Rust NIFs (Native Implemented Functions) for Macula Neuroevolution.
 
